@@ -1,0 +1,11 @@
+(
+  name: "fluidpipeline",
+  summary: "A pipeline for FluCoMa",
+  version: "0.001",
+  schelp: "FluidPipeline.schelp",
+  dependencies: nil,
+  license: "GNU GPL v3.0",
+  copyright: "elgiano",
+  ext_dependency: nil,
+  url: "https://github.com/elgiano/fluidpipeline"
+)
