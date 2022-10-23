@@ -22,7 +22,7 @@ FluidHelper {
 
 		if (timeout.isNil) { cond.wait { done } } { cond.waitFor(timeout) { done } };
 		if (done.not) {
-			if (onTimeout.isFunc) { ^onTimeout.value } {
+			if (onTimeout.isFunction) { ^onTimeout.value } {
 				FluidHelperTimeoutError().throw
 			}
 		};
@@ -64,16 +64,17 @@ FluidHelper {
 	}
 
 	// chain buffer processes. Example with nested chains, to get clarity-weighted mean pitch:
-	// FluidHelper.bufProcessChain(s, buf, nil)
+	// FluidHelper.bufProcessChain(buf, nil)
 	// { FluidBufPitch.process(s, ~src, features: ~dst, action: ~done) }
 	// {
 	//     var pitch = ~src;
-	//     FluidHelper.bufProcessChain(s, ~src, ~dst)
+	//     FluidHelper.bufProcessChain(~src, ~dst)
 	//	   { FluidBufThresh.process(s, ~src, destination: ~dst, action: ~done,
 	//         threshold: 0.8, startChan:1, numChans:1) }
 	//	   { FluidBufStats.process(s, pitch, stats: ~dst, weights: ~src, action: ~done,
 	//         outliersCoeff: 1.5 )}
-	//	   { FluidBufSelect.process(s, ~src, ~dst, channels:[1]), action: ~done }
+	//	   { FluidBufSelect.process(s, ~src, ~dst, channels:[1]), action: ~done };
+	//     ~done.value(~dst)
 	// }
 
 	*bufProcessChain { |srcBuf, destBuf ...functions|
@@ -101,45 +102,38 @@ FluidHelper {
 
 	// runs a chain of async analysis processes, one after the other,
 	// and composes their results in a single one-channel-per-feature buffer.
-	// specific channels can be selected after the analysis by providing a list of indices
 	// functions passed as arguments look like:
-	// { |feat, done| FluidBufPitch.process(features: feat, action: done) }
+	// { FluidBufPitch.process(features: ~dst, action: ~done) }
 	//
-	// var analBuf = FluidHelper.composeAnalysis(s, [0,2])
-	// { |feat, done| FluidBufPitch.process(s, buf, features: feat, action: done) }
-	// { |feat, done| FluidBufLoudness.process(s, buf, features: feat, action: done) }
+	// var analBuf = FluidHelper.bufProcessCompose(sourceBuf)
+	// { |feat, done| FluidBufPitch.process(s, ~src, features: ~dst, action: ~done, select:[\pitch]) }
+	// { |feat, done| FluidBufLoudness.process(s, ~src, features: ~dst, action: ~done) }
 	// // -> analBuf: 2 dimensions = [Pitch, Loudness]
-	*composeAnalysis { |server(Server.default), channels = nil ...funcs|
+	*bufProcessCompose { |srcBuf, destBuf ...functions|
+		var server = srcBuf.server;
 		var analBuf = Buffer(server);
-		var featsBuf = Buffer(server);
+		var chainEnv = Environment(parent:currentEnvironment, know: true);
 		var startChan = 0;
+		if (destBuf.isNil) { destBuf = Buffer(server) };
 
-		funcs.do { |fn|
-			FluidHelper.await { |done|
-				fn.value(analBuf, {
-					FluidBufCompose.process(server, analBuf,
-						destination: featsBuf, destStartChan: startChan,
-						action: done
-					);
-				})
+		forkIfNeeded {
+			functions.do { |analFunc|
+				// [n, src, dst].postln;
+				FluidHelper.await { |done|
+					chainEnv.use {
+						~server = server; ~src = srcBuf; ~dst = analBuf; ~done = {
+							FluidBufCompose.process(server, analBuf,
+								destination: destBuf, destStartChan: startChan,
+								action: done
+							);
+						};
+						analFunc.value(chainEnv);
+					}
+				};
+				startChan = startChan + analBuf.numChannels;
 			};
-			startChan = startChan + analBuf.numChannels;
 		};
-
-		analBuf.free;
-
-		if (channels.isNil) {
-			^featsBuf
-		} {
-			var selectBuf = Buffer(server);
-			FluidHelper.await { |done|
-				FluidBufSelect.process(server, featsBuf, selectBuf,
-					channels: channels, action: done
-				);
-			};
-			featsBuf.free;
-			^selectBuf;
-		}
+		^destBuf;
 	}
 
 	// analyze slices in parallel:
@@ -285,7 +279,7 @@ FluidHelper {
 				var kmeans, ds;
 				kmeans = FluidKMeans(server, nClusters);
 				"[FluidHelper: KMeans Elbow] computing for % clusters".format(nClusters).postln;
-				ds = FluidHelper.fitTransformChain(server, inputDataset, kmeans);
+				ds = FluidHelper.fitTransformChain(inputDataset, kmeans);
 				ds.dump {|dict|
 					var inertia = 0;
 					dict["data"].values.do {|dist|
@@ -338,7 +332,7 @@ FluidHelper {
 	*getPlotterKNNAction { |kdtree, buf_2d, slices, sliceAction|
 		var previous;
 		if (sliceAction.isNil) { ^nil };
-		^{ |uv, x, y|
+		^{ |plotter, x, y|
 			buf_2d.setn(0, [x, y]);
 			kdtree.kNearest(buf_2d, 1) { |nearest|
 				if (previous != nearest) {
@@ -346,7 +340,7 @@ FluidHelper {
 					if (slice.notNil) {
 						previous = nearest;
 						"nearest is % = %".format(nearest, slice).postln;
-						sliceAction.value(slice, nearest.asInteger);
+						sliceAction.value(slice, nearest.asInteger, plotter);
 					} {
 						"nearest is % = not found".format(nearest).postln;
 					}
@@ -423,7 +417,7 @@ FluidHelper {
 
 	*sliceBufToList { |sliceBuf, srcBuf, timeout = 1|
 		var slices = FluidHelper.await ({ |done|
-			sliceBuf.loadToFloatArray(0, -1, { |fa| done.value(fa) });
+			sliceBuf.loadToFloatArray(0, -1, done.value(_));
 		}, timeout, onTimeout: {
 			Error("FluidHelper.sliceBufToList: timeout waiting for slices").throw
 		});
