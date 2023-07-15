@@ -29,6 +29,40 @@ FluidHelper {
 		^res.unbubble;
 	}
 
+	*awaitAll { |maxParallelJobs, asyncFuncs, progressLabel="processing"|
+		var pool = Semaphore(maxParallelJobs);
+		// this (* 20) is arbitrary, quick and dirty
+		var clockWithBigQueue = TempoClock(queueSize: asyncFuncs.size * 20);
+
+		var results = Order[];
+
+		FluidHelper.await { |done|
+			var reportProgress = FluidProgressReport(progressLabel, asyncFuncs.size, clockWithBigQueue);
+			reportProgress.startReport;
+			asyncFuncs.do { |fn, n|
+				fork({
+					protect {
+						pool.wait;
+						results[n] = fn.value;
+					} {
+						var allDone;
+						// ">>> done slice %".format(n).postln;
+						reportProgress.increment;
+						allDone = reportProgress.isDone/*|| (sliceList.size - 1 == n)*/;
+						if (allDone) {
+							reportProgress.printReport;
+							reportProgress.stopReport;
+							done.value;
+						};
+						pool.signal;
+					}
+				}, clockWithBigQueue)
+			}
+		};
+		clockWithBigQueue.stop.clear;
+		^results.asArray;
+	}
+
 	// CHAINS
 
 	*dsProcessChain { |srcDataset, dstDataset ...functions|
@@ -147,47 +181,45 @@ FluidHelper {
 	// which is passed the source buf (the slice's audio) and the destination buf (where to save features)
 	*analSlices { |srcBuf, sliceList, maxParallelJobs=4, analFunc|
 		var server = srcBuf.server;
-		var pool = Semaphore(maxParallelJobs);
 		var dataset = FluidDataSet(server);
-		// this (* 20) is arbitrary, quick and dirty
-		var clockWithBigQueue = TempoClock(queueSize: sliceList.size * 20);
 
-		FluidHelper.await { |done|
-			var reportProgress = FluidProgressReport("analyzing", sliceList.size, clockWithBigQueue);
-			reportProgress.startReport;
-			sliceList.do { |slice, n|
-				fork({
-					protect {
-						var featsBuf, sliceBuf;
-						pool.wait;
-						// "> processing slice %".format(n).postln;
-						featsBuf = Buffer(server);
-						sliceBuf = Buffer.alloc(server, slice.last, 1,
-							completionMessage: srcBuf.copyMsg(_, 0, *slice)
-						);
-						server.sync;
-						analFunc.value(sliceBuf, featsBuf);
-						// ">> anal done slice %".format(n).postln;
-						dataset.addPoint(n, featsBuf);
-						sliceBuf.free;
-						featsBuf.free;
-						server.sync;
-					} {
-						var allDone;
-						// ">>> done slice %".format(n).postln;
-						reportProgress.increment;
-						allDone = reportProgress.isDone/*|| (sliceList.size - 1 == n)*/;
-						if (allDone) {
-							reportProgress.printReport;
-							reportProgress.stopReport;
-							done.value;
-						};
-						pool.signal;
-					}
-				}, clockWithBigQueue)
-			}
-		};
-		clockWithBigQueue.stop.clear;
+		var asyncFns = sliceList.collect { |slice, n| {
+			var featsBuf, sliceBuf;
+			// "> processing slice %".format(n).postln;
+			featsBuf = Buffer(server);
+			sliceBuf = Buffer.alloc(server, slice.last, 1,
+				completionMessage: srcBuf.copyMsg(_, 0, *slice)
+			);
+			server.sync;
+			analFunc.value(sliceBuf, featsBuf);
+			// ">> anal done slice %".format(n).postln;
+			dataset.addPoint(n, featsBuf);
+			sliceBuf.free;
+			featsBuf.free;
+			server.sync;
+		}};
+
+		FluidHelper.awaitAll(maxParallelJobs, asyncFns, "analyzing");
+		^dataset;
+	}
+
+	// analyzes a list of buffers in parallel
+	*analBuffers { |srcBufs, maxParallelJobs=4, analFunc|
+		var server = srcBufs.first.server;
+		var dataset = FluidDataSet(server);
+
+		var asyncFns = srcBufs.collect { |sliceBuf, n| {
+			var featsBuf;
+			// "> processing slice %".format(n).postln;
+			featsBuf = Buffer(server);
+			analFunc.value(sliceBuf, featsBuf);
+			// ">> anal done slice %".format(n).postln;
+			dataset.addPoint(sliceBuf.bufnum, featsBuf);
+			featsBuf.free;
+			server.sync;
+		}};
+
+		FluidHelper.awaitAll(maxParallelJobs, asyncFns, "analyzing");
 		^dataset;
 	}
 
@@ -304,6 +336,16 @@ FluidHelper {
 		^idsByLabel
 	}
 
+	// Kernel-Density-Estimate
+	*kde { |list, bw = 1, numSamples=1000, min, max|
+		list = list / bw;
+		min = (min ?? { list.minItem });
+		max = (max ?? { list.maxItem });
+		^ (min, (max-min)/numSamples + min .. max).collect { |x|
+			list.inject(0) {|s,xi| s + gaussCurve(x-xi) };
+		} / (list.size * bw);
+	}
+
 	// PLOTTER
 
 	// needs to be run in a fork
@@ -374,6 +416,7 @@ FluidHelper {
 	*monofy { |buf|
 		var server = buf.server;
 		var monoBuf = Buffer(server);
+		monoBuf.sampleRate_(buf.sampleRate).cache;
 		buf.query {
 			FluidBufCompose.processBlocking(server, buf, startChan: 0, numChans: 1, gain: (-6).dbamp, destination: monoBuf, destGain: 1);
 			FluidBufCompose.processBlocking(server, buf, startChan: 1, numChans: 1, gain: (-6).dbamp, destination: monoBuf, destGain: 1);
@@ -408,9 +451,53 @@ FluidHelper {
 		^[mean, stdDev];
 	}
 
-	*replaceWindow { |prevWindow, newWindow, fallbackBounds(Rect(200, 200, 800, 800))|
+	*printSliceStats { |sliceList, sampleRate|
+		var durs = sliceList.flop[1];
+		if (sampleRate.notNil) { durs = durs / sampleRate };
+		"[slices] got % slices".format(durs.size).postln;
+		"[slices] avg dur = % +- %".format(*FluidHelper.listStats(durs)).postln;
+	}
+
+	*showSlices { |buffer, slices, bounds(Rect(0,0,800,400)), printStats = true|
+		var histoSteps = 10;
+		var gui = View(bounds:bounds), sliceBuf, sliceList, fwf, histo;
+		forkIfNeeded {
+			if (slices.isKindOf(Buffer)) {
+				sliceBuf = slices;
+				sliceList = FluidHelper.sliceBufToList(slices, buffer);
+			} {
+				sliceList = slices;
+				sliceBuf = FluidHelper.sliceListToBuf(slices, buffer.server)
+			};
+
+			if (printStats) {
+				FluidHelper.printSliceStats(sliceList, buffer.sampleRate)
+			};
+
+			defer {
+				fwf = FluidWaveform(buffer, sliceBuf, standalone: false);
+				histo = View();
+				gui.layout = VLayout(fwf, histo);
+				gui.front;
+				{
+					var sliceStarts = sliceList.flop[0];
+					var histogram = sliceStarts.histo(50);
+					Plotter(parent:histo).plotMode_(\bars)
+					.domainSpecs_(ControlSpec(0, buffer.numFrames))
+					.specs_(ControlSpec(0, histogram.maxItem))
+					.setValue(histogram)
+				}.value;
+			}
+		};
+		^gui;
+	}
+
+
+	*replaceWindow { |prevWindow, newWindow, fallbackBounds = nil|
+		fallbackBounds = fallbackBounds ?? { Rect(200, 200, 800, 800) };
 		defer {
-			newWindow.bounds = try { prevWindow.bounds } ? fallbackBounds;
+			var bounds = try { prevWindow.bounds } ? fallbackBounds;
+			newWindow.resizeToBounds(bounds).moveTo(*bounds.origin.asArray);
 			prevWindow !? { prevWindow.close };
 		}
 	}
@@ -434,6 +521,12 @@ FluidHelper {
 		};
 
 		^slices
+	}
+
+	*sliceListToBuf { |sliceList, server|
+		^FluidHelper.await { |done|
+			Buffer.loadCollection(server, sliceList.flop.first, 1, done)
+		}
 	}
 
 	// clump bundles without calling .bundleSize,
