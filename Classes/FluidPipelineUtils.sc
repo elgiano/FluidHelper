@@ -6,6 +6,8 @@ FluidHelperTimeoutError : Error {
 
 FluidHelper {
 
+	// ASYNC helpers
+
 	// waits for a function callback and returns its results
 	// the provided function should be a wrapper around an async call
 	// *await passes to the wrapper a function to be used as a callback to continue
@@ -65,10 +67,20 @@ FluidHelper {
 
 	// CHAINS
 
+	*prMakeChainEnv {
+		// support EnvironmentRedirect (mainly for FluidPipelineData):
+		// not being a dictionary, it wouldn't work as a parent env
+		// note: it's not possible to change EnvironmentRedirect.envir from chainEnv
+		var parentEnv = if (currentEnvironment.respondsTo(\envir)) {
+			currentEnvironment.envir
+		} { currentEnvironment };
+		^Environment(parent:parentEnv, know: true);
+	}
+
 	*dsProcessChain { |srcDataset, dstDataset ...functions|
 		var server = srcDataset.server;
 		var tempDatasets = functions.drop(-1).collect { FluidDataSet(server) };
-		var chainEnv = Environment(parent:currentEnvironment, know: true);
+		var chainEnv = this.prMakeChainEnv;
 		if (dstDataset.isNil) { dstDataset = FluidDataSet(server) };
 		([srcDataset] ++ tempDatasets ++ [dstDataset]).doAdjacentPairs {|src, dst, n|
 			FluidHelper.await { |done|
@@ -114,17 +126,27 @@ FluidHelper {
 	*bufProcessChain { |srcBuf, destBuf ...functions|
 		var server = srcBuf.server;
 		var tempBuffers = functions.drop(-1).collect { Buffer(server) };
-		var chainEnv = Environment(parent:currentEnvironment, know: true);
+		var chainEnv = this.prMakeChainEnv;
 		if (destBuf.isNil) { destBuf = Buffer(server) };
 		forkIfNeeded {
 			([srcBuf] ++ tempBuffers ++ [destBuf]).doAdjacentPairs {|src, dst, n|
 				// [n, src, dst].postln;
+				var res;
 				FluidHelper.await { |done|
-					chainEnv.use {
+					res = chainEnv.use {
 						~server = server; ~src = src; ~dst = dst; ~done = done;
 						functions[n].value(chainEnv);
 					}
 				};
+
+				// res.postln;
+				// copy partial data if res is buffer
+				if (res.isKindOf(Association) and: {
+					res.value.isKindOf(Buffer)
+				}) {
+					FluidHelper.replaceBuffer(dst, res.value);
+				};
+
 				if (n > 0) {
 					// "freeing %".format(src).postln;
 					src.free
@@ -143,10 +165,11 @@ FluidHelper {
 	// { |feat, done| FluidBufPitch.process(s, ~src, features: ~dst, action: ~done, select:[\pitch]) }
 	// { |feat, done| FluidBufLoudness.process(s, ~src, features: ~dst, action: ~done) }
 	// // -> analBuf: 2 dimensions = [Pitch, Loudness]
+
 	*bufProcessCompose { |srcBuf, destBuf ...functions|
 		var server = srcBuf.server;
 		var analBuf = Buffer(server);
-		var chainEnv = Environment(parent:currentEnvironment, know: true);
+		var chainEnv = this.prMakeChainEnv;
 		var startChan = 0;
 		if (destBuf.isNil) { destBuf = Buffer(server) };
 
@@ -346,6 +369,45 @@ FluidHelper {
 		} / (list.size * bw);
 	}
 
+	// KNN
+
+	*makeLookupDataSet { |src, dst, fn|
+		if (fn.isNil) { fn = _.asFloat };
+		if (dst.isNil) { dst = FluidDataSet(src.server) };
+		if (currentEnvironment !== topEnvironment) {
+			"[FluidHelper: makeLookupDataSet]: fn only supports topEnvironment, currentEnvironment won't be available in fn.".warn;
+		};
+		src.dump { |v|
+			var data = v["data"].keysValuesChange {|k,v|
+				fn.value(k,v).asArray
+			};
+			dst.load((
+				"cols": data.choose.size,
+				"data": data
+			))
+		};
+		^dst;
+	}
+
+	*ugenQuery { |input, numOutputs, fn|
+		var inbuf = this.krToBuf(input);
+		var outbuf = LocalBuf(numOutputs).clear;
+		fn.value(inbuf, outbuf);
+		^FluidBufToKr.kr(outbuf);
+	}
+
+	*knnQuery { |kdtree, input, nOuts, trig, numNeighbours, radius, lookupDataSet|
+		^this.ugenQuery(input, nOuts * numNeighbours) { |inbuf, outbuf|
+			kdtree.kr(trig, inbuf, outbuf, numNeighbours, radius, lookupDataSet);
+		}
+	}
+
+	*krToBuf { |input, buf|
+		buf = buf ?? { LocalBuf(input.size).clear };
+		input.collect { |in, n| BufWr.kr(in, buf, n)};
+		^buf;
+	}
+
 	// PLOTTER
 
 	// needs to be run in a fork
@@ -411,7 +473,61 @@ FluidHelper {
 		};
 	}
 
+	// one plot for each dimension pair. e.g:
+	// dimensions: (a,b,c,d), plots:
+	// (ab) (ac) (ad)
+	//      (bc) (bd)
+	//           (cd)
+	*plotPairs { |dataset|
+		forkIfNeeded {this.prPlotPairs(dataset)}
+	}
+	*prPlotPairs { |dataset|
+        var ds = FluidHelper.await(dataset.dump(_));
+		var n_cols = ds["cols"].asInteger;
+		var spec = {
+			var values = ds["data"].values.flat;
+			ControlSpec(values.minItem, values.maxItem)
+		}.value;
+		var cols = n_cols.collect { |i|
+			var data = ds["data"].collect(_[i]);
+			// var spec = ControlSpec(data.values.minItem, data.values.maxItem);
+			data.keysValuesChange { |k, v| spec.unmap(v) };
+		};
+		var partials = cols.drop(-1).collect { |x,n|
+			allTuples([[x], cols[n+1..]])
+		}.collect { |row| row.collect { |data|
+			var x = data[0].values;
+			Dictionary[
+				"cols" -> 2,
+				"data" -> data[0].merge(data[1], [_,_])
+			]
+		}};
+
+		defer {
+			var plotters = partials.collect { |row| row.collect { |dict|
+				FluidPlotter(dict:dict, standalone: false)
+			}};
+
+			var size = minItem([
+				300 * (n_cols - 1),
+				Window.screenBounds.height, Window.screenBounds.width
+			]);
+			var win = View(bounds:size@size);
+			win.layout = GridLayout.rows(*plotters.collect {|pl,n|
+				View()!n ++ pl
+			});
+			win.front
+		}
+	}
+
 	// MISC
+
+	*replaceBuffer { |src, dst|
+		FluidHelper.await { |done|
+			FluidBufCompose.process(src.server, src, destination: dst,
+				action: done);
+		}
+	}
 
 	*monofy { |buf|
 		var server = buf.server;
@@ -547,20 +663,46 @@ FluidHelper {
 }
 
 
-/*+ FluidDataSet {
-chain { |dstDataset ...processFunctions|
-var tempDatasets = functions.drop(-1).collect { FluidDataSet(server) };
-var chainEnv = Environment(parent: currentEnvironment, know: true);
-if (dstDataset.isNil) { dstDataset = FluidDataSet(this.server) };
-([this] ++ tempDatasets ++ [dstDataset]).doAdjacentPairs {|src, dst, n|
-FluidHelper.await { |done|
-chainEnv.use {
-~src = src; ~dst = dst; ~done = done;
-functions[n].value(chainEnv)
-};
-};
-if (n > 0) { src.clear.free }
-};
-^dstDataset;
++ FluidDataSet {
+	fluidProcessChain { |dstDataset ...functions|
+		if (dstDataset.isFunction) {
+			functions = [dstDataset] ++ functions;
+			dstDataset = nil;
+		};
+		^FluidHelper.dsProcessChain(this, dstDataset, *functions)
+	}
+
+	fitTransformChain { |...transformers|
+		^FluidHelper.fitTransformChain(this, *transformers)
+	}
 }
-}*/
+
++ Buffer {
+
+	fluidProcessChain { |destBuf ...functions|
+		if (destBuf.isFunction) {
+			functions = [destBuf] ++ functions;
+			destBuf = nil;
+		};
+		^FluidHelper.bufProcessChain(this, destBuf, *functions)
+	}
+
+	fluidProcessCompose { |destBuf ...functions|
+		if (destBuf.isFunction) {
+			functions = [destBuf] ++ functions;
+			destBuf = nil;
+		};
+		^FluidHelper.bufProcessCompose(this, destBuf, *functions)
+	}
+
+	toFluidDataset { |ds, transpose=0, labelSet, action|
+		if (ds.isNil) { ds = FluidDataSet(server) };
+		ds.fromBuffer(this, transpose, labelSet, action);
+		^ds
+	}
+
+	analSlices { |sliceList, maxParallelJobs=4, analFunc|
+		^FluidHelper.analSlices(this, sliceList, maxParallelJobs, analFunc);
+	}
+
+}

@@ -1,4 +1,7 @@
 FluidPipelineSlice {
+
+	classvar <>stageTimeout = 90;
+
 	*new { |sliceFunc|
 		sliceFunc ?? {
 			Error('FluidPipelineSlice: you need to provide a slicing function').throw;
@@ -16,7 +19,7 @@ FluidPipelineSlice {
 
 			slices = FluidHelper.await ({ |done|
 				sliceBuf.loadToFloatArray(0, -1, { |fa| done.value(fa) });
-			}, pipeline.stageTimeout, onTimeout: {
+			}, this.stageTimeout, onTimeout: {
 				Error("FluidPipelineSlice: timeout waiting for slices").throw
 			});
 
