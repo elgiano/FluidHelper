@@ -154,7 +154,7 @@ FluidPipelineRun {
 
 	// RUNNING
 
-	run { |stageName, continue = true|
+	run { |stageName, continue = true, action|
 		var stageIndex = if (stageName.isNil) { 0 } {
 			pipeline.stageNames.indexOf(stageName) ?? {
 				"[FluidPipeline] ERROR: no stage named %".format(stageName).warn;
@@ -194,6 +194,7 @@ FluidPipelineRun {
 				};
 			};
 			runningTask = nil;
+			action.value(this);
 		};
 		runningTask.play;
 	}
@@ -244,6 +245,7 @@ FluidPipelineRun {
 
 	checkInputs { |checksDict|
 		checksDict.keysValuesDo { |inputName, checkFn|
+			// default value: e.g. winSize: 1024 -> Integer
 			if (checkFn.isKindOf(Association)) {
 				var default = inputs.use { checkFn.key.value };
 				inputs[inputName] = inputs[inputName] ? default;
@@ -254,9 +256,17 @@ FluidPipelineRun {
 					"FluidPipeline.checkInputs: '%' not found".format(inputName)
 				).throw
 			};
+			// type check: e.g. winSize: Integer
 			if (checkFn.isKindOf(Class)) {
 				var class = checkFn;
 				checkFn = _.isKindOf(class)
+			};
+			// list type check: e.g winSizes: [Integer]
+			if (checkFn.isArray) {
+				var classes = checkFn;
+				checkFn = { |v| v.isArray and: {
+					v.every { |vv| classes.any(vv.isKindOf(_))}
+				}}
 			};
 			if (checkFn.value(inputs[inputName]).not) {
 				Error(
@@ -469,9 +479,9 @@ FluidPipeline {
 
 	// RUN
 
-	run { |inputs, register=false, server(Server.default)|
+	run { |inputs, register=false, server(Server.default), action|
 		var data = FluidPipelineRun(inputs, this, register, server);
-		data.run;
+		data.run(action: action);
 		^data;
 	}
 
