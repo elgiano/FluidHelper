@@ -359,6 +359,60 @@ FluidHelper {
 		^idsByLabel
 	}
 
+	// clone a dataset with its labels
+	*cloneDataset { |src, dst|
+		var s = src.server;
+		dst ?? { dst = FluidDataSet(s) };
+		^FluidHelper.await { |done|
+			var buf = Buffer(s), labels = FluidLabelSet(s);
+			src.getIds(labels) {
+				src.toBuffer(buf, action: {
+					dst.fromBuffer(buf, 0, labels) {
+						labels.free; buf.free;
+						done.value(dst)
+					}
+				});
+			}
+		}
+	}
+
+	// merge a list of datasets into a single one
+	*mergeDatasets { |datasets, overwrite = 0|
+		var dst = FluidHelper.cloneDataset(datasets[0]);
+		^FluidHelper.await { |done|
+			datasets[1..].do { |ds|
+				FluidHelper.await { |d| dst.merge(ds, overwrite, action: d)}
+			};
+			done.value(dst)
+		}
+	}
+
+	// get a list of points by id from src to dst
+	// warning: oneByOne defaults to true because it's anyway faster and more responsive than to dump large datasets
+	*importPoints { |ids, src, dst, oneByOne = true|
+		var s = src.server;
+		dst ?? { dst = FluidDataSet(s) };
+		if (oneByOne) {
+			var tmpbuf = Buffer(s);
+			FluidHelper.awaitAll(1, ids.collect {|id| {
+				FluidHelper.await { |done|
+					src.getPoint(id, tmpbuf) {
+						dst.setPoint(id, tmpbuf, done)
+					}
+				};
+			}}, "importing");
+			tmpbuf.free;
+		} {
+			FluidHelper.await { |done|
+				src.dump { |dict|
+					dict["values"] = dict["values"].atAll(ids);
+					dst.load(dict, action: done);
+				}
+			}
+		};
+		^dst;
+	}
+
 	// Kernel-Density-Estimate
 	*kde { |list, bw = 1, numSamples=1000, min, max|
 		list = list / bw;
@@ -482,7 +536,7 @@ FluidHelper {
 		forkIfNeeded {this.prPlotPairs(dataset)}
 	}
 	*prPlotPairs { |dataset|
-        var ds = FluidHelper.await(dataset.dump(_));
+		var ds = FluidHelper.await(dataset.dump(_));
 		var n_cols = ds["cols"].asInteger;
 		var spec = {
 			var values = ds["data"].values.flat;
